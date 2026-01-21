@@ -27,3 +27,8 @@ log = { version = "0.4.14", optional = true }
 [features]
 defmt = ["dep:defmt", "embassy-usb-driver/defmt"]
 log = ["dep:log"]
+## AR8030 specific DWC2 quirks:
+## - Core soft reset before initialization
+## - SETUP_DATA_DONE signals setup completion
+## - EP0 IN/OUT need explicit usbaep and epena
+ar8030 = []

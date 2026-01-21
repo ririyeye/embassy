@@ -106,6 +106,9 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
             }
             vals::Pktstsd::SETUP_DATA_DONE => {
                 trace!("SETUP_DATA_DONE ep={}", ep_num);
+                // AR8030: Set setup_ready here as some DWC2 cores signal SETUP completion via SETUP_DATA_DONE
+                #[cfg(feature = "ar8030")]
+                state.cp_state.setup_ready.store(true, Ordering::Release);
             }
             x => trace!("unknown PKTSTS: {}", x.to_bits()),
         }
@@ -625,6 +628,25 @@ impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
         let r = self.instance.regs;
         let phy_type = self.instance.phy_type;
 
+        // AR8030/DWC2: Perform core soft reset before initialization
+        #[cfg(feature = "ar8030")]
+        {
+            // Wait for AHB master IDLE
+            for _ in 0..200000 {
+                if r.grstctl().read().ahbidl() {
+                    break;
+                }
+            }
+            // Trigger core soft reset
+            r.grstctl().modify(|w| w.set_csrst(true));
+            // Wait for reset to complete (CSRST bit self-clears)
+            for _ in 0..200000 {
+                if !r.grstctl().read().csrst() {
+                    break;
+                }
+            }
+        }
+
         // Soft disconnect.
         r.dctl().write(|w| w.set_sdis(true));
 
@@ -727,6 +749,9 @@ impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
                     regs.diepctl(index).write(|w| {
                         if index == 0 {
                             w.set_mpsiz(ep0_mpsiz(ep.max_packet_size));
+                            // AR8030: EP0 IN must have usbaep set to be active
+                            #[cfg(feature = "ar8030")]
+                            w.set_usbaep(true);
                         } else {
                             w.set_mpsiz(ep.max_packet_size);
                             w.set_eptyp(to_eptyp(ep.ep_type));
@@ -746,6 +771,12 @@ impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
                     regs.doepctl(index).write(|w| {
                         if index == 0 {
                             w.set_mpsiz(ep0_mpsiz(ep.max_packet_size));
+                            // AR8030: EP0 OUT must have usbaep set and enabled
+                            #[cfg(feature = "ar8030")]
+                            {
+                                w.set_usbaep(true);
+                                w.set_epena(true);
+                            }
                         } else {
                             w.set_mpsiz(ep.max_packet_size);
                             w.set_eptyp(to_eptyp(ep.ep_type));
