@@ -32,3 +32,6 @@ log = ["dep:log"]
 ## - SETUP_DATA_DONE signals setup completion
 ## - EP0 IN/OUT need explicit usbaep and epena
 ar8030 = []
+## DMA mode support for DWC2 with internal DMA
+## Requires: 4-byte aligned buffers, cache coherency handling
+dma = []

@@ -351,6 +351,12 @@ impl Otg {
         assert!(n < 16usize);
         unsafe { Reg::from_ptr(self.ptr.add(0x0910usize + n * 32usize) as _) }
     }
+    #[doc = "Device IN endpoint DMA address register"]
+    #[inline(always)]
+    pub fn diepdma(self, n: usize) -> Reg<u32, RW> {
+        assert!(n < 16usize);
+        unsafe { Reg::from_ptr(self.ptr.add(0x0914usize + n * 32usize) as _) }
+    }
     #[doc = "Device IN endpoint transmit FIFO status register"]
     #[inline(always)]
     pub fn dtxfsts(self, n: usize) -> Reg<regs::Dtxfsts, R> {
