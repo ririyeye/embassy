@@ -29,7 +29,7 @@ pub mod otg_v1;
 use otg_v1::{Otg, regs, vals};
 
 /// Handle interrupts.
-pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_EP_COUNT>, ep_count: usize) {
+pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_EP_COUNT>, _ep_count: usize) {
     trace!("irq");
 
     let ints = r.gintsts().read();
@@ -63,7 +63,7 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
             let ep_num = status.epnum() as usize;
             let len = status.bcnt() as usize;
 
-            assert!(ep_num < ep_count);
+            assert!(ep_num < _ep_count);
 
             match status.pktstsd() {
                 vals::Pktstsd::SETUP_DATA_RX => {
