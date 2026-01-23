@@ -1600,41 +1600,21 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
                 trace!("DMA TX enabled: diepctl=0x{:08x}", diepctl_after.0);
             });
             
-            // Wait for DMA transfer to complete (epena will be cleared when done)
-            // Also check for endpoint being disabled (bus reset) to avoid infinite wait
-            let mut poll_count = 0u32;
+            // Wait for DMA transfer to complete
+            // The interrupt handler will wake us when XFRC fires (which clears epena)
             poll_fn(|cx| {
                 self.state.in_waker.register(cx.waker());
                 
                 let diepctl = self.regs.diepctl(index).read();
-                let diepint = self.regs.diepint(index).read();
-                trace!("DMA TX wait: ep={} epena={} naksts={} diepint=0x{:08x}", index, diepctl.epena(), diepctl.naksts(), diepint.0);
                 
                 if !diepctl.epena() {
-                    // Transfer complete (normal completion)
-                    trace!("DMA TX done: ep={}", index);
+                    // Transfer complete (epena cleared by hardware on XFRC)
                     Poll::Ready(())
                 } else if !diepctl.usbaep() {
-                    // Endpoint was disabled (likely due to bus reset)
-                    trace!("DMA TX aborted: ep={} endpoint disabled", index);
+                    // Endpoint disabled (bus reset)
                     Poll::Ready(())
                 } else {
-                    // Still in progress - increment poll count to detect potential issues
-                    poll_count += 1;
-                    if poll_count > 100 {
-                        // Too many polls without completion - likely stuck
-                        // Force disable the endpoint and abort
-                        trace!("DMA TX timeout: ep={} poll_count={}, forcing abort", index, poll_count);
-                        critical_section::with(|_| {
-                            self.regs.diepctl(index).modify(|w| {
-                                w.set_epdis(true);
-                                w.set_snak(true);
-                            });
-                        });
-                        Poll::Ready(())
-                    } else {
-                        Poll::Pending
-                    }
+                    Poll::Pending
                 }
             })
             .await;
