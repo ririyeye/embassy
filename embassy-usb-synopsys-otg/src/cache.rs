@@ -10,6 +10,12 @@
 #[cfg(feature = "ar8030")]
 pub const CACHE_LINE_SIZE: usize = 32;
 
+#[cfg(feature = "ar8030")]
+const CACHE_UNROLL_FACTOR: usize = 4;
+
+#[cfg(feature = "ar8030")]
+const CACHE_UNROLL_BYTES: usize = CACHE_LINE_SIZE * CACHE_UNROLL_FACTOR;
+
 /// Invalidate data cache for the given address range.
 ///
 /// This must be called AFTER DMA RX completes to ensure the CPU sees
@@ -33,6 +39,31 @@ pub unsafe fn dcache_invalidate_range(start: usize, len: usize) {
     core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags));
 
     let mut addr = start_aligned;
+    while addr + CACHE_UNROLL_BYTES <= end_aligned {
+        // Unroll to reduce branch overhead in large DMA buffers.
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02a",
+            in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02a",
+            in(reg) addr + CACHE_LINE_SIZE,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02a",
+            in(reg) addr + CACHE_LINE_SIZE * 2,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02a",
+            in(reg) addr + CACHE_LINE_SIZE * 3,
+            options(nostack, preserves_flags)
+        );
+        addr += CACHE_UNROLL_BYTES;
+    }
+
     while addr < end_aligned {
         // T-HEAD extension: dcache.ipa (invalidate by physical address)
         // Instruction encoding: imm12 = 0x02a
@@ -71,6 +102,31 @@ pub unsafe fn dcache_clean_range(start: usize, len: usize) {
     core::arch::asm!("fence", options(nostack, preserves_flags));
 
     let mut addr = start_aligned;
+    while addr + CACHE_UNROLL_BYTES <= end_aligned {
+        // Unroll to reduce branch overhead in large DMA buffers.
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x029",
+            in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x029",
+            in(reg) addr + CACHE_LINE_SIZE,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x029",
+            in(reg) addr + CACHE_LINE_SIZE * 2,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x029",
+            in(reg) addr + CACHE_LINE_SIZE * 3,
+            options(nostack, preserves_flags)
+        );
+        addr += CACHE_UNROLL_BYTES;
+    }
+
     while addr < end_aligned {
         // T-HEAD extension: dcache.cpa (clean by physical address)
         // Instruction encoding: imm12 = 0x029
@@ -109,6 +165,31 @@ pub unsafe fn dcache_clean_invalidate_range(start: usize, len: usize) {
     core::arch::asm!("fence", options(nostack, preserves_flags));
 
     let mut addr = start_aligned;
+    while addr + CACHE_UNROLL_BYTES <= end_aligned {
+        // Unroll to reduce branch overhead in large DMA buffers.
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02b",
+            in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02b",
+            in(reg) addr + CACHE_LINE_SIZE,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02b",
+            in(reg) addr + CACHE_LINE_SIZE * 2,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            ".insn i 0x0b, 0, x0, {0}, 0x02b",
+            in(reg) addr + CACHE_LINE_SIZE * 3,
+            options(nostack, preserves_flags)
+        );
+        addr += CACHE_UNROLL_BYTES;
+    }
+
     while addr < end_aligned {
         // T-HEAD extension: dcache.cipa (clean + invalidate by physical address)
         // Instruction encoding: imm12 = 0x02b
