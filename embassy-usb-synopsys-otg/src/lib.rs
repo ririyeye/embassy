@@ -1346,20 +1346,28 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
         if self.dma_enable {
             // Only configure if no data is pending
             if self.state.out_size.load(Ordering::Relaxed) == EP_OUT_BUFFER_EMPTY {
+                // DMA directly to user buffer for multi-packet support
+                let max_pkt = self.info.max_packet_size as u32;
+                let xfer_size = buf.len() as u32;
+                let pktcnt = if xfer_size == 0 { 1 } else { (xfer_size + max_pkt - 1) / max_pkt };
+
+                // Invalidate cache for user buffer before DMA writes to it
+                unsafe {
+                    cache::dcache_invalidate_range(buf.as_ptr() as usize, buf.len());
+                }
+
                 critical_section::with(|_| {
-                    let xfer_size = self.info.max_packet_size as u32;
-                    
                     // Store original transfer size for length calculation in interrupt
                     self.state.out_xfer_size.store(xfer_size as u16, Ordering::Release);
                     
-                    // Configure DOEPTSIZ
+                    // Configure DOEPTSIZ with multi-packet support
                     self.regs.doeptsiz(index).modify(|w| {
                         w.set_xfrsiz(xfer_size);
-                        w.set_pktcnt(1);
+                        w.set_pktcnt(pktcnt as _);
                     });
                     
-                    // Set DMA address to out_buffer
-                    let dma_addr = unsafe { *self.state.out_buffer.get() } as u32;
+                    // DMA directly to user buffer (zero-copy!)
+                    let dma_addr = buf.as_mut_ptr() as u32;
                     self.regs.doepdma(index).write_value(dma_addr);
                     
                     // Enable endpoint
@@ -1368,7 +1376,7 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
                         w.set_epena(true);
                     });
                     
-                    trace!("DMA read configured: ep={} dma_addr={:08x} xfrsiz={}", index, dma_addr, xfer_size);
+                    trace!("DMA read configured: ep={} dma_addr={:08x} xfrsiz={} pktcnt={}", index, dma_addr, xfer_size, pktcnt);
                 });
             }
         }
@@ -1391,82 +1399,41 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
                     return Poll::Ready(Err(EndpointError::BufferOverflow));
                 }
 
-                // SAFETY: exclusive access ensured by `out_size` atomic variable
-                let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
-                
-                // In DMA mode, invalidate cache before reading received data
                 #[cfg(feature = "dma")]
-                if self.dma_enable && len > 0 {
-                    unsafe {
-                        cache::dcache_invalidate_range(data.as_ptr() as usize, len as usize);
+                if self.dma_enable {
+                    // DMA wrote directly to user buffer, invalidate cache before reading
+                    if len > 0 {
+                        unsafe {
+                            cache::dcache_invalidate_range(buf.as_ptr() as usize, len as usize);
+                        }
                     }
+                    // Release buffer (data already in user buf, no copy needed)
+                    self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+                    return Poll::Ready(Ok(len as usize));
                 }
-                
-                buf[..len as usize].copy_from_slice(data);
+
+                // FIFO mode: copy from internal out_buffer
+                #[cfg(not(feature = "dma"))]
+                {
+                    let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
+                    buf[..len as usize].copy_from_slice(data);
+                }
+                #[cfg(feature = "dma")]
+                if !self.dma_enable {
+                    let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
+                    buf[..len as usize].copy_from_slice(data);
+                }
 
                 // Release buffer
                 self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
 
-                // Re-enable endpoint for next transfer
+                // Re-enable endpoint for next transfer (FIFO mode only; DMA re-arms in next read() call)
                 #[cfg(feature = "dma")]
-                if self.dma_enable {
-                    // DMA mode: immediately configure next transfer to avoid NAK
-                    critical_section::with(|_| {
-                        let xfer_size = self.info.max_packet_size as u32;
-                        
-                        // Store original transfer size for length calculation in interrupt
-                        self.state.out_xfer_size.store(xfer_size as u16, Ordering::Release);
-                        
-                        // Configure DOEPTSIZ
-                        self.regs.doeptsiz(index).modify(|w| {
-                            w.set_xfrsiz(xfer_size);
-                            w.set_pktcnt(1);
-                        });
-                        
-                        // Set DMA address to out_buffer
-                        let dma_addr = unsafe { *self.state.out_buffer.get() } as u32;
-                        self.regs.doepdma(index).write_value(dma_addr);
-                        
-                        // Enable endpoint
-                        self.regs.doepctl(index).modify(|w| {
-                            w.set_cnak(true);
-                            w.set_epena(true);
-                        });
-                        
-                        trace!("DMA read re-armed: ep={} dma_addr={:08x}", index, dma_addr);
-                    });
-                } else {
-                    // FIFO mode: re-enable endpoint for next transfer
-                    critical_section::with(|_| {
-                        // Receive 1 packet
-                        self.regs.doeptsiz(index).modify(|w| {
-                            w.set_xfrsiz(self.info.max_packet_size as _);
-                            w.set_pktcnt(1);
-                        });
-
-                        if self.info.ep_type == EndpointType::Isochronous {
-                            // Isochronous endpoints must set the correct even/odd frame bit to
-                            // correspond with the next frame's number.
-                            let frame_number = self.regs.dsts().read().fnsof();
-                            let frame_is_odd = frame_number & 0x01 == 1;
-
-                            self.regs.doepctl(index).modify(|r| {
-                                if frame_is_odd {
-                                    r.set_sd0pid_sevnfrm(true);
-                                } else {
-                                    r.set_sd1pid_soddfrm(true);
-                                }
-                            });
-                        }
-
-                        // Clear NAK to indicate we are ready to receive more data
-                        self.regs.doepctl(index).modify(|w| {
-                            w.set_cnak(true);
-                        });
-                    });
-                }
+                let need_fifo_rearm = !self.dma_enable;
                 #[cfg(not(feature = "dma"))]
-                {
+                let need_fifo_rearm = true;
+
+                if need_fifo_rearm {
                     // FIFO mode: re-enable endpoint for next transfer
                     critical_section::with(|_| {
                         // Receive 1 packet
@@ -1510,7 +1477,13 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
     async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
         trace!("write ep={:?} len={}", self.info.addr, buf.len());
 
-        if buf.len() > self.info.max_packet_size as usize {
+        #[cfg(feature = "dma")]
+        let is_dma = self.dma_enable;
+        #[cfg(not(feature = "dma"))]
+        let is_dma = false;
+
+        // In FIFO mode, limit to max_packet_size. In DMA mode, hardware handles multi-packet.
+        if !is_dma && buf.len() > self.info.max_packet_size as usize {
             return Err(EndpointError::BufferOverflow);
         }
 
@@ -1555,10 +1528,12 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
             }
 
             critical_section::with(|_| {
-                // Setup transfer size (for ZLP, xfrsiz=0, pktcnt=1)
+                // Setup transfer size with multi-packet support
+                let max_pkt = self.info.max_packet_size as u32;
+                let pktcnt = if buf.is_empty() { 1 } else { (buf.len() as u32 + max_pkt - 1) / max_pkt };
                 self.regs.dieptsiz(index).write(|w| {
                     w.set_mcnt(1);
-                    w.set_pktcnt(1);
+                    w.set_pktcnt(pktcnt as _);
                     w.set_xfrsiz(buf.len() as _);
                 });
 
