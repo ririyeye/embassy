@@ -256,6 +256,10 @@ stm32-hrtim = ["dep:stm32-hrtim"]
 
 ## Enable USB host mode support
 usb-host = ["embassy-usb-synopsys-otg/host"]
+## Enable DWC2 internal-DMA mode (device side). The application still has to set
+## `embassy_stm32::usb::Config::dma_enable = true` to actually turn it on. Only
+## chips with a DMA-capable OTG core (STM32F4/F7/H7) benefit.
+usb-otg-dma = ["embassy-usb-synopsys-otg/dma"]
 
 exti = []
 low-power = [ "time" ]

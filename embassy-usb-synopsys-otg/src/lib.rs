@@ -7,6 +7,9 @@
 // This must go FIRST so that all the other modules see its macros.
 mod fmt;
 
+#[cfg(feature = "dma")]
+mod cache;
+
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
@@ -33,18 +36,39 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
     trace!("irq");
 
     let ints = r.gintsts().read();
+
+    #[cfg(feature = "dma")]
+    let dma_enabled = state.dma_enabled.load(Ordering::Relaxed);
+    #[cfg(not(feature = "dma"))]
+    let dma_enabled = false;
+
     if ints.wkupint() || ints.usbsusp() || ints.usbrst() || ints.enumdne() || ints.otgint() || ints.srqint() {
         // Mask interrupts and notify `Bus` to process them
         r.gintmsk().write(|w| {
             w.set_iepint(true);
             w.set_oepint(true);
-            w.set_rxflvlm(true);
+            // RX FIFO interrupt is meaningless in DMA mode (the engine writes
+            // straight to memory and the FIFO never fills with the
+            // application's data path), so leave it masked.
+            if !dma_enabled {
+                w.set_rxflvlm(true);
+            }
         });
         state.bus_waker.wake();
     }
 
+    // The RX FIFO path only runs in slave (FIFO) mode. In DMA mode the engine
+    // writes packets directly to the buffers programmed via DOEPDMA and we
+    // notify the application from the OEP transfer-complete handler below.
+    if dma_enabled {
+        // Skip the FIFO drain loop entirely.
+        if false {
+            // Keep `ep_count` referenced in DMA-only builds.
+            let _ = ep_count;
+        }
+    }
     // Handle RX
-    while r.gintsts().read().rxflvl() {
+    while !dma_enabled && r.gintsts().read().rxflvl() {
         let status = r.grxstsp().read();
         trace!("=== status {:08x}", status.0);
         let ep_num = status.epnum() as usize;
@@ -147,7 +171,7 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
 
     // out endpoint interrupt
     if ints.oepint() {
-        trace!("oepint");
+        trace!("oepint dma={}", dma_enabled);
         let mut ep_mask = r.daint().read().oepint();
         let mut ep_num = 0;
 
@@ -159,8 +183,53 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
                 r.doepint(ep_num).write_value(ep_ints);
 
                 if ep_ints.stup() {
+                    #[cfg(feature = "dma")]
+                    if dma_enabled && ep_num == 0 {
+                        // The DWC2 wrote the SETUP packet directly to the
+                        // setup_dma_buf via the AHB master. Invalidate D-Cache
+                        // (the line covers the whole 32-byte buffer) so we
+                        // observe the freshly DMA'd bytes.
+                        unsafe {
+                            let setup_buf_addr = state.cp_state.setup_dma_buf.get() as usize;
+                            cache::dcache_invalidate_range(setup_buf_addr, 32);
+                        }
+                        let setup_buf = unsafe { &(*state.cp_state.setup_dma_buf.get()).0 };
+                        let word0 = u32::from_le_bytes([setup_buf[0], setup_buf[1], setup_buf[2], setup_buf[3]]);
+                        let word1 = u32::from_le_bytes([setup_buf[4], setup_buf[5], setup_buf[6], setup_buf[7]]);
+                        state.cp_state.setup_data[0].store(word0, Ordering::Relaxed);
+                        state.cp_state.setup_data[1].store(word1, Ordering::Relaxed);
+                        trace!("DMA SETUP received: {:08x} {:08x}", word0, word1);
+
+                        // Re-arm EP0 OUT for the *next* SETUP packet. Without
+                        // this the controller keeps NAK'ing back-to-back SETUPs.
+                        r.doeptsiz(0).write(|w| {
+                            w.set_pktcnt(1);
+                            w.set_xfrsiz(3 * 8); // 3 SETUP packets max
+                            w.set_rxdpid_stupcnt(3);
+                        });
+                        r.doepdma(0).write_value(state.setup_dma_buf_addr());
+                        r.doepctl(0).modify(|w| {
+                            w.set_cnak(true);
+                            w.set_epena(true);
+                        });
+                    }
                     state.cp_state.setup_ready.store(true, Ordering::Release);
                 }
+
+                // In DMA mode, XFRC signals data-transfer completion and the
+                // remaining XFRSIZ tells us how many bytes the DMA wrote.
+                #[cfg(feature = "dma")]
+                if dma_enabled && ep_ints.xfrc() && !ep_ints.stup() {
+                    let original = state.ep_states[ep_num].out_xfer_size.load(Ordering::Acquire) as u32;
+                    let remaining = r.doeptsiz(ep_num).read().xfrsiz();
+                    let received = original.saturating_sub(remaining) as u16;
+                    trace!(
+                        "DMA OUT XFRC ep={} original={} remaining={} received={}",
+                        ep_num, original, remaining, received
+                    );
+                    state.ep_states[ep_num].out_size.store(received, Ordering::Release);
+                }
+
                 state.ep_states[ep_num].out_waker.wake();
                 trace!("out ep={} irq val={:08x}", ep_num, ep_ints.0);
             }
@@ -274,6 +343,11 @@ struct EpState {
     /// Buffers are ready when associated [State::ep_out_size] != [EP_OUT_BUFFER_EMPTY].
     out_buffer: UnsafeCell<*mut u8>,
     out_size: AtomicU16,
+    /// Original DOEPTSIZ.XFRSIZ programmed for the active DMA OUT transfer.
+    /// Used to compute the number of bytes the DMA engine actually wrote when
+    /// XFRC fires (received = original - remaining).
+    #[cfg(feature = "dma")]
+    out_xfer_size: AtomicU16,
 }
 
 // SAFETY: The EndpointAllocator ensures that the buffer points to valid memory exclusive for each endpoint and is
@@ -282,10 +356,22 @@ struct EpState {
 unsafe impl Send for EpState {}
 unsafe impl Sync for EpState {}
 
+/// 32-byte aligned scratch area where the DWC2 hardware DMAs SETUP packets in
+/// internal-DMA mode. ARMv7-M cache lines are 32 bytes, so aligning the buffer
+/// to 32 ensures cache invalidation only touches this object.
+#[cfg(feature = "dma")]
+#[repr(C, align(32))]
+struct SetupDmaBuf([u8; 32]);
+
 struct ControlPipeSetupState {
     /// Holds received SETUP packets. Available if [Ep0State::setup_ready] is true.
     setup_data: [AtomicU32; 2],
     setup_ready: AtomicBool,
+    /// Hardware DMA destination for SETUP packets. The first 8 bytes carry the
+    /// most recent SETUP request; the remaining 16 bytes back stop additional
+    /// back-to-back SETUPs (PKTCNT=1, RXDPID_STUPCNT=3 → 24 bytes max).
+    #[cfg(feature = "dma")]
+    setup_dma_buf: UnsafeCell<SetupDmaBuf>,
 }
 
 /// USB OTG driver state.
@@ -293,6 +379,10 @@ pub struct State<const EP_COUNT: usize> {
     cp_state: ControlPipeSetupState,
     ep_states: [EpState; EP_COUNT],
     bus_waker: AtomicWaker,
+    /// Mirrors `Config::dma_enable` so the interrupt handler does not have to
+    /// reach back through the driver. Set once during `Bus::init`.
+    #[cfg(feature = "dma")]
+    dma_enabled: AtomicBool,
 }
 
 unsafe impl<const EP_COUNT: usize> Send for State<EP_COUNT> {}
@@ -305,6 +395,8 @@ impl<const EP_COUNT: usize> State<EP_COUNT> {
             cp_state: ControlPipeSetupState {
                 setup_data: [const { AtomicU32::new(0) }; 2],
                 setup_ready: AtomicBool::new(false),
+                #[cfg(feature = "dma")]
+                setup_dma_buf: UnsafeCell::new(SetupDmaBuf([0u8; 32])),
             },
             ep_states: [const {
                 EpState {
@@ -312,10 +404,21 @@ impl<const EP_COUNT: usize> State<EP_COUNT> {
                     out_waker: AtomicWaker::new(),
                     out_buffer: UnsafeCell::new(0 as _),
                     out_size: AtomicU16::new(EP_OUT_BUFFER_EMPTY),
+                    #[cfg(feature = "dma")]
+                    out_xfer_size: AtomicU16::new(0),
                 }
             }; EP_COUNT],
             bus_waker: AtomicWaker::new(),
+            #[cfg(feature = "dma")]
+            dma_enabled: AtomicBool::new(false),
         }
+    }
+
+    /// Address (as a 32-bit DMA address) of the SETUP scratch buffer. The OTG
+    /// core writes the next SETUP packet here whenever EP0 OUT is armed.
+    #[cfg(feature = "dma")]
+    fn setup_dma_buf_addr(&self) -> u32 {
+        self.cp_state.setup_dma_buf.get() as u32
     }
 }
 
@@ -353,6 +456,21 @@ pub struct Config {
     /// enumerates in FS mode. Some USB Link IP like those in the STM32H7 series support adding this delay to work with
     /// the affected PHYs.
     pub xcvrdly: bool,
+
+    /// Enable DWC2 internal DMA mode for data transfers.
+    ///
+    /// When set, USB packets are moved by the controller's built-in AHB master
+    /// instead of being copied through the FIFO by the CPU, which dramatically
+    /// reduces overhead on bulk endpoints (the AR8030 reference port saturates
+    /// HS at ~200 Mbps with this turned on).
+    ///
+    /// Requirements:
+    /// - The OTG core must be DMA-capable (STM32F4/F7/H7 OTG_HS, H7 OTG_FS).
+    /// - All `read`/`write` buffers must be 4-byte aligned and live in memory
+    ///   reachable by the AHB master.
+    /// - On Cortex-M7 the D-Cache is handled automatically (see `cache.rs`).
+    #[cfg(feature = "dma")]
+    pub dma_enable: bool,
 }
 
 impl Default for Config {
@@ -360,6 +478,8 @@ impl Default for Config {
         Self {
             vbus_detection: false,
             xcvrdly: false,
+            #[cfg(feature = "dma")]
+            dma_enable: false,
         }
     }
 }
@@ -425,8 +545,24 @@ impl<'d, const MAX_EP_COUNT: usize> Driver<'d, MAX_EP_COUNT> {
 
         let fifo_size_words = match D::dir() {
             Direction::Out => (max_packet_size + 3) / 4,
-            // INEPTXFD requires minimum size of 16 words
-            Direction::In => u16::max((max_packet_size + 3) / 4, 16),
+            Direction::In => {
+                // INEPTXFD requires minimum size of 16 words.
+                let base = u16::max((max_packet_size + 3) / 4, 16);
+                // In DMA mode, scaling the per-EP TX FIFO up lets the AHB
+                // master pre-fetch several packets so back-to-back IN tokens
+                // get answered without a NAK gap. Cap at 4 KiB to leave room
+                // for OUT and other endpoints in the shared FIFO bank.
+                #[cfg(feature = "dma")]
+                let result = if self.config.dma_enable {
+                    let scaled = base.saturating_mul(4);
+                    u16::min(scaled, 1024)
+                } else {
+                    base
+                };
+                #[cfg(not(feature = "dma"))]
+                let result = base;
+                result
+            }
         };
 
         if fifo_size_words + self.allocated_fifo_words() > self.instance.fifo_depth_words {
@@ -501,6 +637,8 @@ impl<'d, const MAX_EP_COUNT: usize> Driver<'d, MAX_EP_COUNT> {
                 max_packet_size,
                 interval_ms,
             },
+            #[cfg(feature = "dma")]
+            dma_enable: self.config.dma_enable,
         })
     }
 }
@@ -575,6 +713,10 @@ pub struct Bus<'d, const MAX_EP_COUNT: usize> {
 
 impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
     fn restore_irqs(&mut self) {
+        #[cfg(feature = "dma")]
+        let dma_enabled = self.config.dma_enable;
+        #[cfg(not(feature = "dma"))]
+        let dma_enabled = false;
         self.instance.regs.gintmsk().write(|w| {
             w.set_usbrst(true);
             w.set_enumdnem(true);
@@ -582,7 +724,11 @@ impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
             w.set_wuim(true);
             w.set_iepint(true);
             w.set_oepint(true);
-            w.set_rxflvlm(true);
+            // RX-FIFO interrupt only matters in slave (FIFO) mode; in DMA mode
+            // the controller never raises it for the data path.
+            if !dma_enabled {
+                w.set_rxflvlm(true);
+            }
             w.set_srqim(true);
             w.set_otgint(true);
         });
@@ -757,18 +903,39 @@ impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
             w.set_xfrcm(true);
         });
 
-        // Unmask SETUP received EP interrupt
+        // Unmask SETUP received EP interrupt. In DMA mode we additionally need
+        // XFRCM so the OEP IRQ fires when a multi-packet DMA write finishes.
         r.doepmsk().write(|w| {
             w.set_stupm(true);
+            #[cfg(feature = "dma")]
+            if self.config.dma_enable {
+                w.set_xfrcm(true);
+            }
         });
+
+        #[cfg(feature = "dma")]
+        if self.config.dma_enable {
+            // Make the IRQ handler observe DMA mode before global IRQs go back
+            // on. From this point on it skips the FIFO drain loop and instead
+            // computes received lengths from DOEPTSIZ.
+            self.instance.state.dma_enabled.store(true, Ordering::Release);
+        }
 
         // Unmask and clear core interrupts
         self.restore_irqs();
         r.gintsts().write_value(regs::Gintsts(0xFFFF_FFFF));
 
-        // Unmask global interrupt
+        // Unmask global interrupt and, when requested, switch the AHB master
+        // into DMA mode with INCR4 bursts (best balance between throughput and
+        // bus contention on STM32 H7 / F7 according to the C HAL drivers).
         r.gahbcfg().write(|w| {
-            w.set_gint(true); // unmask global interrupt
+            w.set_gint(true);
+            #[cfg(feature = "dma")]
+            if self.config.dma_enable {
+                w.set_hbstlen(4);
+                w.set_dmaen(true);
+                trace!("OTG GAHBCFG: DMA enabled, HBSTLEN=INCR4");
+            }
         });
 
         // Connect
@@ -868,14 +1035,39 @@ impl<'d, const MAX_EP_COUNT: usize> Bus<'d, MAX_EP_COUNT> {
                         }
                     });
 
-                    regs.doeptsiz(index).modify(|w| {
-                        w.set_xfrsiz(ep.max_packet_size as _);
-                        if index == 0 {
-                            w.set_rxdpid_stupcnt(3);
+                    if index == 0 {
+                        // In DMA mode EP0 OUT must be primed with DOEPDMA +
+                        // EPENA so the controller can land the very first
+                        // SETUP packet in our scratch buffer.
+                        #[cfg(feature = "dma")]
+                        if self.config.dma_enable {
+                            regs.doeptsiz(0).write(|w| {
+                                w.set_pktcnt(1);
+                                w.set_xfrsiz(3 * 8);
+                                w.set_rxdpid_stupcnt(3);
+                            });
+                            regs.doepdma(0).write_value(self.instance.state.setup_dma_buf_addr());
+                            regs.doepctl(0).modify(|w| {
+                                w.set_cnak(true);
+                                w.set_epena(true);
+                            });
                         } else {
-                            w.set_pktcnt(1);
+                            regs.doeptsiz(0).modify(|w| {
+                                w.set_xfrsiz(ep.max_packet_size as _);
+                                w.set_rxdpid_stupcnt(3);
+                            });
                         }
-                    });
+                        #[cfg(not(feature = "dma"))]
+                        regs.doeptsiz(0).modify(|w| {
+                            w.set_xfrsiz(ep.max_packet_size as _);
+                            w.set_rxdpid_stupcnt(3);
+                        });
+                    } else {
+                        regs.doeptsiz(index).modify(|w| {
+                            w.set_xfrsiz(ep.max_packet_size as _);
+                            w.set_pktcnt(1);
+                        });
+                    }
                 });
             }
         }
@@ -953,6 +1145,43 @@ impl<'d, const MAX_EP_COUNT: usize> embassy_usb_driver::Bus for Bus<'d, MAX_EP_C
 
             if ints.usbrst() {
                 trace!("reset");
+
+                #[cfg(feature = "dma")]
+                if self.config.dma_enable {
+                    // Active DMA TX transfers must be aborted before init_fifo
+                    // starts the FIFO flush, otherwise the AHB master keeps
+                    // pulling from random RAM addresses while we tear the FIFO
+                    // configuration down.
+                    let ep_count = self.instance.endpoint_count;
+                    for i in 0..ep_count {
+                        let diepctl = regs.diepctl(i).read();
+                        if diepctl.epena() {
+                            trace!("bus reset: aborting DMA TX on ep={}", i);
+                            regs.diepctl(i).modify(|w| {
+                                w.set_epdis(true);
+                                w.set_snak(true);
+                            });
+                            // wait for hardware to actually disable the EP
+                            for _ in 0..1000 {
+                                if !regs.diepctl(i).read().epena() {
+                                    break;
+                                }
+                            }
+                        }
+                        // Clear any pending IEP interrupts so the next transfer
+                        // starts from a clean slate.
+                        let pending = regs.diepint(i).read();
+                        regs.diepint(i).write_value(pending);
+                    }
+                    // Wake every endpoint waker. The application's `read`/
+                    // `write` futures discover that EPENA is clear (or
+                    // USBAEP=0) and either retry or return Disabled.
+                    let state = self.instance.state;
+                    for i in 0..ep_count {
+                        state.ep_states[i].in_waker.wake();
+                        state.ep_states[i].out_waker.wake();
+                    }
+                }
 
                 self.init_fifo();
                 self.configure_endpoints();
@@ -1061,6 +1290,11 @@ impl<'d, const MAX_EP_COUNT: usize> embassy_usb_driver::Bus for Bus<'d, MAX_EP_C
         let state = self.instance.state;
         match ep_addr.direction() {
             Direction::Out => {
+                #[cfg(feature = "dma")]
+                let dma = self.config.dma_enable;
+                #[cfg(not(feature = "dma"))]
+                let dma = false;
+
                 critical_section::with(|_| {
                     // cancel transfer if active
                     if !enabled && regs.doepctl(ep_addr.index()).read().epena() {
@@ -1074,9 +1308,15 @@ impl<'d, const MAX_EP_COUNT: usize> embassy_usb_driver::Bus for Bus<'d, MAX_EP_C
                         w.set_usbaep(enabled);
                     });
 
-                    // When re-enabling a non-EP0 OUT endpoint, prime it to receive a packet.
-                    // Without this, the endpoint stays idle after reconnect and silently drops data.
-                    if enabled && ep_addr.index() != 0 {
+                    // When re-enabling a non-EP0 OUT endpoint, prime it to
+                    // receive a packet. Without this the FIFO-mode endpoint
+                    // stays idle after reconnect and silently drops data. In
+                    // DMA mode we must NOT prime here, because DOEPDMA has not
+                    // been programmed yet and the AHB master would write the
+                    // first received packet to a stale address (typically 0,
+                    // since `Endpoint::read` is what fills DOEPDMA). The DMA
+                    // path arms the endpoint on demand from inside `read`.
+                    if enabled && ep_addr.index() != 0 && !dma {
                         if let Some(ep) = &self.ep_out[ep_addr.index()] {
                             regs.doeptsiz(ep_addr.index()).modify(|w| {
                                 w.set_xfrsiz(ep.max_packet_size as _);
@@ -1177,6 +1417,8 @@ pub struct Endpoint<'d, D> {
     regs: Otg,
     info: EndpointInfo,
     state: &'d EpState,
+    #[cfg(feature = "dma")]
+    dma_enable: bool,
 }
 
 impl<'d> embassy_usb_driver::Endpoint for Endpoint<'d, In> {
@@ -1223,10 +1465,58 @@ impl<'d> embassy_usb_driver::Endpoint for Endpoint<'d, Out> {
 
 impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
-        trace!("read start len={}", buf.len());
+        let index = self.info.addr.index();
+        trace!("read start ep={:?} len={}", self.info.addr, buf.len());
+
+        // ---------------------------------------------------------------
+        // DMA mode: arm the AHB master to write straight into the user
+        // buffer. The hardware splits the transfer into max-packet chunks
+        // and signals XFRC when either PKTCNT runs out or a short packet
+        // arrives, so we get true zero-copy multi-packet bulk reads.
+        // ---------------------------------------------------------------
+        #[cfg(feature = "dma")]
+        if self.dma_enable {
+            // Only program a new transfer if the previous one's data has
+            // already been consumed; otherwise just fall through and pick
+            // up the pending `out_size`.
+            if self.state.out_size.load(Ordering::Relaxed) == EP_OUT_BUFFER_EMPTY {
+                let max_pkt = self.info.max_packet_size as u32;
+                let xfer_size = buf.len() as u32;
+                let pktcnt = if xfer_size == 0 {
+                    1
+                } else {
+                    (xfer_size + max_pkt - 1) / max_pkt
+                };
+
+                // Drop any stale data sitting in cache for this range so that
+                // the post-DMA invalidation (below) cannot restore it.
+                unsafe {
+                    cache::dcache_invalidate_range(buf.as_ptr() as usize, buf.len());
+                }
+
+                critical_section::with(|_| {
+                    self.state.out_xfer_size.store(xfer_size as u16, Ordering::Release);
+                    self.regs.doeptsiz(index).modify(|w| {
+                        w.set_xfrsiz(xfer_size);
+                        w.set_pktcnt(pktcnt as _);
+                    });
+                    self.regs.doepdma(index).write_value(buf.as_mut_ptr() as u32);
+                    self.regs.doepctl(index).modify(|w| {
+                        w.set_cnak(true);
+                        w.set_epena(true);
+                    });
+                });
+                trace!(
+                    "DMA OUT armed ep={} addr=0x{:08x} xfrsiz={} pktcnt={}",
+                    index,
+                    buf.as_ptr() as u32,
+                    xfer_size,
+                    pktcnt
+                );
+            }
+        }
 
         poll_fn(|cx| {
-            let index = self.info.addr.index();
             self.state.out_waker.register(cx.waker());
 
             let doepctl = self.regs.doepctl(index).read();
@@ -1244,42 +1534,137 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
                     return Poll::Ready(Err(EndpointError::BufferOverflow));
                 }
 
-                // SAFETY: exclusive access ensured by `out_size` atomic variable
-                let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
-                buf[..len as usize].copy_from_slice(data);
+                #[cfg(feature = "dma")]
+                if self.dma_enable {
+                    // Hardware just wrote the user buffer; invalidate it once
+                    // more so the next CPU read returns DMA bytes, not stale
+                    // cached data from before the transfer.
+                    if len > 0 {
+                        unsafe {
+                            cache::dcache_invalidate_range(buf.as_ptr() as usize, len as usize);
+                        }
+                    }
+                    self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+                    return Poll::Ready(Ok(len as usize));
+                }
+
+                // FIFO mode: copy from the per-endpoint scratch buffer that
+                // the IRQ handler filled out of the shared RX FIFO.
+                #[cfg(not(feature = "dma"))]
+                {
+                    let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
+                    buf[..len as usize].copy_from_slice(data);
+                }
+                #[cfg(feature = "dma")]
+                if !self.dma_enable {
+                    let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
+                    buf[..len as usize].copy_from_slice(data);
+                }
 
                 // Release buffer
                 self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
 
-                critical_section::with(|_| {
-                    // Receive 1 packet
-                    self.regs.doeptsiz(index).modify(|w| {
-                        w.set_xfrsiz(self.info.max_packet_size as _);
-                        w.set_pktcnt(1);
-                    });
+                #[cfg(feature = "dma")]
+                let need_fifo_rearm = !self.dma_enable;
+                #[cfg(not(feature = "dma"))]
+                let need_fifo_rearm = true;
 
-                    if self.info.ep_type == EndpointType::Isochronous {
-                        // Isochronous endpoints must set the correct even/odd frame bit to
-                        // correspond with the next frame's number.
-                        let frame_number = self.regs.dsts().read().fnsof();
-                        let frame_is_odd = frame_number & 0x01 == 1;
-
-                        self.regs.doepctl(index).modify(|r| {
-                            if frame_is_odd {
-                                r.set_sd0pid_sevnfrm(true);
-                            } else {
-                                r.set_soddfrm(true);
-                            }
+                if need_fifo_rearm {
+                    critical_section::with(|_| {
+                        // Receive 1 packet
+                        self.regs.doeptsiz(index).modify(|w| {
+                            w.set_xfrsiz(self.info.max_packet_size as _);
+                            w.set_pktcnt(1);
                         });
-                    }
 
-                    // Clear NAK to indicate we are ready to receive more data
-                    self.regs.doepctl(index).modify(|w| {
-                        w.set_cnak(true);
+                        if self.info.ep_type == EndpointType::Isochronous {
+                            // Isochronous endpoints must set the correct even/odd frame bit to
+                            // correspond with the next frame's number.
+                            let frame_number = self.regs.dsts().read().fnsof();
+                            let frame_is_odd = frame_number & 0x01 == 1;
+
+                            self.regs.doepctl(index).modify(|r| {
+                                if frame_is_odd {
+                                    r.set_sd0pid_sevnfrm(true);
+                                } else {
+                                    r.set_soddfrm(true);
+                                }
+                            });
+                        }
+
+                        // Clear NAK to indicate we are ready to receive more data
+                        self.regs.doepctl(index).modify(|w| {
+                            w.set_cnak(true);
+                        });
                     });
-                });
+                }
 
                 Poll::Ready(Ok(len as usize))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<'d> Endpoint<'d, In> {
+    /// Program DIEPDMA + DIEPTSIZ + EPENA for a single (possibly empty) IN
+    /// transfer in DMA mode. ZLPs use `buf = &[]`, the DMA engine writes
+    /// `xfrsiz=0, pktcnt=1` and the IN token returns an empty data packet.
+    fn dma_arm_in(&self, index: usize, buf: &[u8], max_pkt: u32) {
+        critical_section::with(|_| {
+            let pktcnt = if buf.is_empty() {
+                1
+            } else {
+                (buf.len() as u32 + max_pkt - 1) / max_pkt
+            };
+            self.regs.dieptsiz(index).write(|w| {
+                w.set_mcnt(1);
+                w.set_pktcnt(pktcnt as _);
+                w.set_xfrsiz(buf.len() as _);
+            });
+            // For a ZLP DIEPDMA still has to be a valid address even though
+            // xfrsiz=0 means the DMA never reads it.
+            let dma_addr = buf.as_ptr() as u32;
+            self.regs.diepdma(index).write_value(dma_addr);
+
+            if self.info.ep_type == EndpointType::Isochronous {
+                let frame_number = self.regs.dsts().read().fnsof();
+                let frame_is_odd = frame_number & 0x01 == 1;
+                self.regs.diepctl(index).modify(|r| {
+                    if frame_is_odd {
+                        r.set_sd0pid_sevnfrm(true);
+                    } else {
+                        r.set_soddfrm_sd1pid(true);
+                    }
+                });
+            }
+
+            self.regs.diepctl(index).modify(|w| {
+                w.set_cnak(true);
+                w.set_epena(true);
+            });
+
+            trace!(
+                "DMA IN armed ep={} addr=0x{:08x} len={} pktcnt={}",
+                index,
+                dma_addr,
+                buf.len(),
+                pktcnt
+            );
+        });
+    }
+
+    /// Wait for an in-flight DMA IN transfer on `index` to finish (XFRC
+    /// clears EPENA in hardware) or for the bus to drop the endpoint.
+    async fn dma_wait_in_done(&self, index: usize) {
+        poll_fn(|cx| {
+            self.state.in_waker.register(cx.waker());
+            let diepctl = self.regs.diepctl(index).read();
+            if !diepctl.usbaep() || !diepctl.epena() {
+                Poll::Ready(())
             } else {
                 Poll::Pending
             }
@@ -1292,7 +1677,15 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
     async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
         trace!("write ep={:?} data={:?}", self.info.addr, Bytes(buf));
 
-        if buf.len() > self.info.max_packet_size as usize {
+        #[cfg(feature = "dma")]
+        let dma = self.dma_enable;
+        #[cfg(not(feature = "dma"))]
+        let dma = false;
+
+        // FIFO mode is constrained to a single max-packet write per call. DMA
+        // mode lets the controller chop the user buffer into multiple packets,
+        // so any length up to xfrsiz/pktcnt limits is fine.
+        if !dma && buf.len() > self.info.max_packet_size as usize {
             return Err(EndpointError::BufferOverflow);
         }
 
@@ -1320,6 +1713,43 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
         })
         .await?;
 
+        // ---------------------------------------------------------------
+        // DMA path: program DIEPDMA + DIEPTSIZ for multi-packet transfer
+        // and let the AHB master pull from `buf` directly. After the data
+        // transfer, if the payload length is a non-zero multiple of the max
+        // packet size, append a ZLP so the host can terminate its current
+        // bulk IRP (mandatory whenever the host's read length is unknown to
+        // the device, e.g. when nusb's `reader(N)` issues a 16 KiB IRP).
+        // ---------------------------------------------------------------
+        #[cfg(feature = "dma")]
+        if dma {
+            let max_pkt = self.info.max_packet_size as u32;
+            let need_zlp_after =
+                !buf.is_empty() && (buf.len() as u32) % max_pkt == 0 && self.info.ep_type == EndpointType::Bulk;
+
+            // ---- 1. data phase ----
+            if !buf.is_empty() {
+                unsafe {
+                    cache::dcache_clean_range(buf.as_ptr() as usize, buf.len());
+                }
+            }
+            self.dma_arm_in(index, buf, max_pkt);
+            self.dma_wait_in_done(index).await;
+
+            // ---- 2. ZLP terminator ----
+            if need_zlp_after {
+                self.dma_arm_in(index, &[], max_pkt);
+                self.dma_wait_in_done(index).await;
+                trace!("DMA IN ZLP ep={:?}", self.info.addr);
+            }
+
+            trace!("DMA write done ep={:?}", self.info.addr);
+            return Ok(());
+        }
+
+        // ---------------------------------------------------------------
+        // FIFO path (original implementation).
+        // ---------------------------------------------------------------
         if buf.len() > 0 {
             poll_fn(|cx| {
                 self.state.in_waker.register(cx.waker());
@@ -1419,6 +1849,31 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
     async fn setup(&mut self) -> [u8; 8] {
         poll_fn(|cx| {
             self.ep_out.state.out_waker.register(cx.waker());
+            let ep_index = self.ep_out.info.addr.index();
+
+            // In DMA mode the IRQ handler already re-arms EP0 OUT for the
+            // next SETUP, but if the application is just polling for the very
+            // first SETUP we need to make sure EPENA is set. This is harmless
+            // if it already is.
+            #[cfg(feature = "dma")]
+            if self.ep_out.dma_enable {
+                let doepctl = self.regs.doepctl(ep_index).read();
+                if !doepctl.epena() {
+                    self.regs.doeptsiz(ep_index).write(|w| {
+                        w.set_pktcnt(1);
+                        w.set_xfrsiz(3 * 8);
+                        w.set_rxdpid_stupcnt(3);
+                    });
+                    self.regs
+                        .doepdma(ep_index)
+                        .write_value(self.setup_state.setup_dma_buf.get() as u32);
+                    self.regs.doepctl(ep_index).modify(|w| {
+                        w.set_cnak(true);
+                        w.set_epena(true);
+                    });
+                    trace!("DMA EP0 OUT primed for SETUP from setup()");
+                }
+            }
 
             if self.setup_state.setup_ready.load(Ordering::Relaxed) {
                 let mut data = [0; 8];
@@ -1426,15 +1881,19 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
                 data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
                 self.setup_state.setup_ready.store(false, Ordering::Release);
 
-                // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
-                self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
-                    w.set_rxdpid_stupcnt(3);
-                });
-
-                // Clear NAK to indicate we are ready to receive more data
-                self.regs
-                    .doepctl(self.ep_out.info.addr.index())
-                    .modify(|w| w.set_cnak(true));
+                // FIFO mode needs DOEPTSIZ.RXDPID_STUPCNT primed again before
+                // re-clearing NAK; the DMA path already did this in the IRQ
+                // handler when it re-armed EP0 OUT for the next SETUP.
+                #[cfg(feature = "dma")]
+                let dma = self.ep_out.dma_enable;
+                #[cfg(not(feature = "dma"))]
+                let dma = false;
+                if !dma {
+                    self.regs.doeptsiz(ep_index).modify(|w| {
+                        w.set_rxdpid_stupcnt(3);
+                    });
+                    self.regs.doepctl(ep_index).modify(|w| w.set_cnak(true));
+                }
 
                 trace!("SETUP received: {:?}", Bytes(&data));
                 Poll::Ready(data)

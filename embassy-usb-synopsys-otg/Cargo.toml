@@ -31,3 +31,11 @@ default = []
 defmt = ["dep:defmt", "embassy-usb-driver/defmt"]
 log = ["dep:log"]
 host = []
+## Enable DWC2 internal-DMA mode for device transfers.
+##
+## When this feature is on the application can set [`Config::dma_enable = true`]
+## to make the controller move bulk/interrupt/iso data with its built-in DMA
+## engine instead of CPU-driven FIFO copies. Buffers passed to `read`/`write`
+## must be 4-byte aligned, and on Cortex-M7 D-Cache is handled automatically
+## via SCB clean/invalidate by virtual address.
+dma = []
