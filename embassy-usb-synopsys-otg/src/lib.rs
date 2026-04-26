@@ -1714,20 +1714,18 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
         .await?;
 
         // ---------------------------------------------------------------
-        // DMA path: program DIEPDMA + DIEPTSIZ for multi-packet transfer
-        // and let the AHB master pull from `buf` directly. After the data
-        // transfer, if the payload length is a non-zero multiple of the max
-        // packet size, append a ZLP so the host can terminate its current
-        // bulk IRP (mandatory whenever the host's read length is unknown to
-        // the device, e.g. when nusb's `reader(N)` issues a 16 KiB IRP).
+        // DMA path: program DIEPDMA + DIEPTSIZ for one (possibly empty)
+        // multi-packet IN transfer and let the AHB master pull from `buf`
+        // directly. The driver does NOT auto-append a ZLP after aligned
+        // writes: the application is responsible for terminating its
+        // logical transfer with `write(&[])` when the host's IRP is bigger
+        // than the actual payload (this lets `4 KiB + 4 KiB + 4 KiB + ZLP`
+        // patterns avoid one ZLP per chunk and saturate the wire).
         // ---------------------------------------------------------------
         #[cfg(feature = "dma")]
         if dma {
             let max_pkt = self.info.max_packet_size as u32;
-            let need_zlp_after =
-                !buf.is_empty() && (buf.len() as u32) % max_pkt == 0 && self.info.ep_type == EndpointType::Bulk;
 
-            // ---- 1. data phase ----
             if !buf.is_empty() {
                 unsafe {
                     cache::dcache_clean_range(buf.as_ptr() as usize, buf.len());
@@ -1735,13 +1733,6 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
             }
             self.dma_arm_in(index, buf, max_pkt);
             self.dma_wait_in_done(index).await;
-
-            // ---- 2. ZLP terminator ----
-            if need_zlp_after {
-                self.dma_arm_in(index, &[], max_pkt);
-                self.dma_wait_in_done(index).await;
-                trace!("DMA IN ZLP ep={:?}", self.info.addr);
-            }
 
             trace!("DMA write done ep={:?}", self.info.addr);
             return Ok(());
