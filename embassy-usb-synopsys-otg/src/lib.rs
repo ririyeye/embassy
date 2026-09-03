@@ -1166,6 +1166,8 @@ where
                     regs.diepctl(index).write(|w| {
                         if index == 0 {
                             w.set_mpsiz(ep0_mpsiz(ep.max_packet_size));
+                            // STM32 hardwires EP0 USBAEP; GD32 USBFS clears it on write().
+                            w.set_usbaep(true);
                         } else {
                             w.set_mpsiz(ep.max_packet_size);
                             w.set_eptyp(to_eptyp(ep.ep_type));
@@ -1175,7 +1177,7 @@ where
                         }
                     });
                 });
-                // Mirror USBAEP: hardwired on for EP0, cleared by the write above for the rest.
+                // Mirror USBAEP: explicitly set for EP0 by the write above, cleared for the rest.
                 st.ep_states[index].in_enabled.store(index == 0, Ordering::Release);
             }
         }
@@ -1187,6 +1189,7 @@ where
                     regs.doepctl(index).write(|w| {
                         if index == 0 {
                             w.set_mpsiz(ep0_mpsiz(ep.max_packet_size));
+                            w.set_usbaep(true);
                         } else {
                             w.set_mpsiz(ep.max_packet_size);
                             w.set_eptyp(to_eptyp(ep.ep_type));
@@ -1196,10 +1199,9 @@ where
 
                     regs.doeptsiz(index).modify(|w| {
                         w.set_xfrsiz(ep.max_packet_size as _);
+                        w.set_pktcnt(1);
                         if index == 0 {
                             w.set_rxdpid_stupcnt(3);
-                        } else {
-                            w.set_pktcnt(1);
                         }
                     });
 
@@ -1210,7 +1212,7 @@ where
                         });
                     }
                 });
-                // Mirror USBAEP: hardwired on for EP0, cleared by the write above for the rest.
+                // Mirror USBAEP: explicitly set for EP0 by the write above, cleared for the rest.
                 st.ep_states[index].out_enabled.store(index == 0, Ordering::Release);
             }
         }
@@ -1690,6 +1692,33 @@ where
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("read start len={}", buf.len());
 
+        let index = self.info.addr.index();
+        // GD32 USBFS / newer DWC2 drop EPENA after SETUP. Embassy only
+        // re-enables after a received packet, so a control-IN status ZLP
+        // (and the next OUT) is never primed and enumeration stalls.
+        //
+        // Restrict to EP0: a disabled non-EP0 OUT endpoint also has EPENA
+        // clear and an empty buffer after `endpoint_set_enabled(false)`, and
+        // re-arming it here would make it ACK packets while the class still
+        // considers it disabled.
+        if index == 0
+            && self.state.out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY
+            && !self.regs.doepctl(index).read().epena()
+        {
+            self.mutex.lock(|| {
+                self.regs.doeptsiz(index).modify(|w| {
+                    w.set_xfrsiz(self.info.max_packet_size as _);
+                    w.set_pktcnt(1);
+                    w.set_rxdpid_stupcnt(3);
+                });
+                self.regs.doepctl(index).modify(|w| {
+                    w.set_usbaep(true);
+                    w.set_epena(true);
+                    w.set_cnak(true);
+                });
+            });
+        }
+
         poll_fn(|cx| {
             let index = self.info.addr.index();
             self.state.out_waker.register(cx.waker());
@@ -1798,7 +1827,10 @@ where
                 let size_words = (buf.len() + 3) / 4;
 
                 let fifo_space = self.regs.dtxfsts(index).read().ineptfsav() as usize;
-                if size_words > fifo_space {
+                // GD32 USBFS (and some DWC FS cores) report DTXFSTS=0 while
+                // EPENA is clear. TXFE is also not raised before EPENA, so
+                // treating 0 as "full" deadlocks EP0 IN (GET_DESCRIPTOR).
+                if fifo_space != 0 && size_words > fifo_space {
                     // Not enough space in fifo, enable tx fifo empty interrupt
                     self.mutex.lock(|| {
                         self.regs.diepempmsk().modify(|w| {
@@ -1844,8 +1876,9 @@ where
                 });
             }
 
-            // Enable endpoint
+            // Enable endpoint. USBAEP is not hardwired on GD32 USBFS EP0.
             self.regs.diepctl(index).modify(|w| {
+                w.set_usbaep(true);
                 w.set_cnak(true);
                 w.set_epena(true);
             });
@@ -1904,15 +1937,18 @@ where
                 data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
                 self.setup_state.setup_ready.store(false, Ordering::Release);
 
-                // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
-                self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
+                // Re-prime EP0 OUT after SETUP (GD32 `usb_ctlep_startout` + CNAK/EPENA).
+                // STUPCNT alone leaves EPENA clear, so the status-stage ZLP is NAKed.
+                self.regs.doeptsiz(self.ep_out.info.addr.index()).write(|w| {
+                    w.set_xfrsiz(self.max_packet_size as _);
+                    w.set_pktcnt(1);
                     w.set_rxdpid_stupcnt(3);
                 });
-
-                // Clear NAK to indicate we are ready to receive more data
-                self.regs
-                    .doepctl(self.ep_out.info.addr.index())
-                    .modify(|w| w.set_cnak(true));
+                self.regs.doepctl(self.ep_out.info.addr.index()).modify(|w| {
+                    w.set_usbaep(true);
+                    w.set_cnak(true);
+                    w.set_epena(true);
+                });
 
                 trace!("SETUP received: {:?}", Bytes(&data));
                 Poll::Ready(data)
